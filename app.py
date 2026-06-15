@@ -54,7 +54,7 @@ def health():
 # Core: list sounds with objective filters and sorting.
 # No subjective scoring — raw signals only.
 # ---------------------------------------------------------------------------
-def _apply_query(data):
+def _apply_query(data, default_sort=None):
     """Apply objective filters, sorting and pagination from query params."""
     # --- filters ---
     if request.args.get("unsigned") == "true":
@@ -78,7 +78,8 @@ def _apply_query(data):
 
     # --- sorting ---
     has_counts = any(s.get("tiktok_videos") is not None for s in data)
-    default_sort = "tiktok_videos" if has_counts else "chart_rank"
+    if default_sort is None:
+        default_sort = "tiktok_videos" if has_counts else "chart_rank"
     sort_by = request.args.get("sort", default_sort)
     sort_map = {
         "tiktok_videos": (lambda s: _int(s.get("tiktok_videos")), True),
@@ -87,8 +88,10 @@ def _apply_query(data):
         "velocity": (lambda s: _int(s.get("velocity")), True),
         "growth": (lambda s: _int(s.get("stream_growth_7d")), True),
         "chart_rank": (lambda s: s.get("chart_rank", 9999), False),
+        # spread: most countries first, then best rank as tiebreaker
+        "spread": (lambda s: (s.get("countries_count", 1), -s.get("chart_rank", 9999)), True),
     }
-    key, default_desc = sort_map.get(sort_by, sort_map[default_sort])
+    key, default_desc = sort_map.get(sort_by, sort_map.get(default_sort, sort_map["chart_rank"]))
     order = request.args.get("order")
     reverse = (order != "asc") if order else default_desc
     data = sorted(data, key=key, reverse=reverse)
@@ -123,14 +126,29 @@ def sounds():
 
 @app.route("/tiktok-trends")
 def tiktok_trends():
-    """Sounds going viral on social platforms incl. TikTok (Shazam viral chart).
+    """Sounds spreading across multiple countries — a real virality signal.
 
-    Source: Apple's official Shazam-driven viral feed — public, legal, no scraping.
-    This captures sounds breaking out on TikTok and other social platforms,
-    rather than the all-time most-streamed tracks.
+    Derived from the live chart data: a sound charting in several countries at
+    once is propagating, not just locally popular. This is an honest, computed
+    proxy for 'going viral' built on real data — no scraping, no fake numbers.
+    Exact TikTok video counts come from the licensed Pro plan.
     """
-    result = _apply_query(get_sounds(feed="viral"))
-    result["feed"] = "tiktok-trends (Shazam viral / social)"
+    data = get_sounds(feed="most-played")
+
+    # keep only sounds spreading across 2+ countries (real cross-market signal)
+    min_countries = 2
+    try:
+        min_countries = max(1, int(request.args.get("min_countries", 2)))
+    except ValueError:
+        pass
+    spreading = [s for s in data if s.get("countries_count", 1) >= min_countries]
+
+    # apply standard filters (genre, country, q) but NOT the rank default sort
+    result = _apply_query(spreading, default_sort="spread")
+    result["feed"] = "tiktok-trends (cross-country spread)"
+    result["note"] = ("Sounds charting in {}+ countries simultaneously — "
+                      "a propagation signal. Exact TikTok metrics on Pro plan."
+                      .format(min_countries))
     return jsonify(result)
 
 
