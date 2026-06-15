@@ -29,16 +29,19 @@ def _int(v):
 @app.route("/")
 def root():
     return jsonify({
-        "service": "ZEUS API",
-        "description": "Objective cross-platform signals for TikTok sounds (A&R radar)",
+        "service": "ZEUS — TikTok & Shazam Trending Sounds API",
+        "tagline": "Real-time trending sounds across multiple countries, from official charts.",
         "data_source": get_provider().name,
-        "endpoints": [
-            "GET /sounds            — list sounds (filters + sorting)",
-            "GET /sounds/<isrc>     — single sound by ISRC",
-            "GET /unsigned          — unsigned artists only",
-            "GET /stats             — aggregate counters",
-        ],
-        "version": "0.1.0",
+        "endpoints": {
+            "GET /sounds": "Top streamed sounds (Apple Music chart)",
+            "GET /tiktok-trends": "Sounds going viral on social incl. TikTok (Shazam viral chart)",
+            "GET /sounds/<id>": "Single sound by id",
+            "GET /stats": "Coverage: countries, top genres, totals",
+            "GET /unsigned": "Unsigned-artist leads (Pro plan)",
+            "GET /health": "Health check",
+        },
+        "filters": ["country", "genre", "q", "sort", "order", "limit", "offset"],
+        "version": "1.0.0",
     })
 
 
@@ -51,21 +54,22 @@ def health():
 # Core: list sounds with objective filters and sorting.
 # No subjective scoring — raw signals only.
 # ---------------------------------------------------------------------------
-@app.route("/sounds")
-def sounds():
-    data = get_sounds()
-
-    # --- filters (all objective) ---
+def _apply_query(data):
+    """Apply objective filters, sorting and pagination from query params."""
+    # --- filters ---
     if request.args.get("unsigned") == "true":
-        data = [s for s in data if s.get("signed") is False]
+        data = [s for s in data if (s.get("signed") is False or s.get("_signed") is False)]
 
     genre = request.args.get("genre")
     if genre:
         data = [s for s in data if s.get("genre", "").lower() == genre.lower()]
 
-    region = request.args.get("region")
+    region = request.args.get("region") or request.args.get("country")
     if region:
-        data = [s for s in data if region.upper() in [r.upper() for r in s.get("regions", [])]]
+        def in_region(s):
+            zones = s.get("regions") or s.get("trending_in") or []
+            return region.upper() in [z.upper() for z in zones]
+        data = [s for s in data if in_region(s)]
 
     q = request.args.get("q")
     if q:
@@ -73,7 +77,6 @@ def sounds():
         data = [s for s in data if ql in s.get("title", "").lower() or ql in s.get("artist", "").lower()]
 
     # --- sorting ---
-    # default depends on source: chart data sorts by rank, rich data by TikTok volume
     has_counts = any(s.get("tiktok_videos") is not None for s in data)
     default_sort = "tiktok_videos" if has_counts else "chart_rank"
     sort_by = request.args.get("sort", default_sort)
@@ -83,7 +86,7 @@ def sounds():
         "listeners": (lambda s: _int(s.get("spotify_listeners")), True),
         "velocity": (lambda s: _int(s.get("velocity")), True),
         "growth": (lambda s: _int(s.get("stream_growth_7d")), True),
-        "chart_rank": (lambda s: s.get("chart_rank", 9999), False),  # ascending = best rank first
+        "chart_rank": (lambda s: s.get("chart_rank", 9999), False),
     }
     key, default_desc = sort_map.get(sort_by, sort_map[default_sort])
     order = request.args.get("order")
@@ -102,52 +105,77 @@ def sounds():
 
     total = len(data)
     page = data[offset:offset + limit]
-
-    return jsonify({
+    return {
         "count": len(page),
         "total": total,
         "offset": offset,
         "sort": sort_by,
         "order": order,
         "data": page,
-    })
+    }
 
 
-@app.route("/sounds/<isrc>")
-def sound_detail(isrc):
+@app.route("/sounds")
+def sounds():
+    """Top streamed/played sounds (Apple Music chart)."""
+    return jsonify(_apply_query(get_sounds(feed="most-played")))
+
+
+@app.route("/tiktok-trends")
+def tiktok_trends():
+    """Sounds going viral on social platforms incl. TikTok (Shazam viral chart).
+
+    Source: Apple's official Shazam-driven viral feed — public, legal, no scraping.
+    This captures sounds breaking out on TikTok and other social platforms,
+    rather than the all-time most-streamed tracks.
+    """
+    result = _apply_query(get_sounds(feed="viral"))
+    result["feed"] = "tiktok-trends (Shazam viral / social)"
+    return jsonify(result)
+
+
+@app.route("/sounds/<sound_id>")
+def sound_detail(sound_id):
     for s in get_sounds():
-        if s["isrc"].lower() == isrc.lower():
+        if (s.get("isrc") or "").lower() == sound_id.lower() or str(s.get("id", "")).lower() == sound_id.lower():
             return jsonify(s)
-    return jsonify({"error": "sound not found", "isrc": isrc}), 404
+    return jsonify({"error": "sound not found", "id": sound_id}), 404
 
 
 @app.route("/unsigned")
 def unsigned():
-    data = [s for s in get_sounds() if s.get("signed") is False]
-    data = sorted(data, key=lambda s: _int(s.get("tiktok_videos")) or -s.get("chart_rank", 9999), reverse=True)
-    return jsonify({"count": len(data), "data": data})
+    data = get_sounds()
+    # rich schema: real signed flag. chart schema: status unknown (premium feature)
+    enriched = [s for s in data if s.get("signed") is not None]
+    if not enriched:
+        return jsonify({
+            "count": 0,
+            "data": [],
+            "note": "Unsigned-artist detection requires the Pro plan (licensed enrichment). "
+                    "The free chart plan does not expose label/signing status.",
+        })
+    result = [s for s in enriched if s.get("signed") is False]
+    result = sorted(result, key=lambda s: _int(s.get("tiktok_videos")), reverse=True)
+    return jsonify({"count": len(result), "data": result})
 
 
 @app.route("/stats")
 def stats():
     data = get_sounds()
-    unsigned_count = sum(1 for s in data if s.get("signed") is False)
-    signed_count = sum(1 for s in data if s.get("signed") is True)
-    total_videos = sum(_int(s.get("tiktok_videos")) for s in data)
-    risers = [s for s in data if s.get("velocity")]
-    fastest = max(risers, key=lambda s: _int(s.get("velocity")), default=None)
+    countries = set()
+    genres = {}
+    for s in data:
+        for c in (s.get("trending_in") or s.get("regions") or []):
+            countries.add(c)
+        g = s.get("genre", "Unknown")
+        genres[g] = genres.get(g, 0) + 1
+    top_genres = sorted(genres.items(), key=lambda x: x[1], reverse=True)[:5]
     return jsonify({
         "sounds_tracked": len(data),
-        "unsigned": unsigned_count,
-        "signed": signed_count,
-        "unknown_signed_status": len(data) - unsigned_count - signed_count,
-        "total_tiktok_videos": total_videos,
-        "fastest_riser": {
-            "title": fastest["title"],
-            "artist": fastest["artist"],
-            "velocity": fastest["velocity"],
-        } if fastest else None,
+        "countries_covered": sorted(countries),
+        "top_genres": [{"genre": g, "count": n} for g, n in top_genres],
         "data_source": get_provider().name,
+        "updated": data[0].get("detected") if data else None,
     })
 
 
