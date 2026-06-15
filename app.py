@@ -90,6 +90,8 @@ def _apply_query(data, default_sort=None):
         "chart_rank": (lambda s: s.get("chart_rank", 9999), False),
         # spread: most countries first, then best rank as tiebreaker
         "spread": (lambda s: (s.get("countries_count", 1), -s.get("chart_rank", 9999)), True),
+        # emerging: freshness x reach score (set by /tiktok-trends)
+        "emerging": (lambda s: s.get("emerging_score", 0), True),
     }
     key, default_desc = sort_map.get(sort_by, sort_map.get(default_sort, sort_map["chart_rank"]))
     order = request.args.get("order")
@@ -126,16 +128,19 @@ def sounds():
 
 @app.route("/tiktok-trends")
 def tiktok_trends():
-    """Sounds spreading across multiple countries — a real virality signal.
+    """Recent sounds spreading fast across countries — emerging-hit radar.
 
-    Derived from the live chart data: a sound charting in several countries at
-    once is propagating, not just locally popular. This is an honest, computed
-    proxy for 'going viral' built on real data — no scraping, no fake numbers.
-    Exact TikTok video counts come from the licensed Pro plan.
+    Combines two real signals from live chart data:
+      - cross-country spread (how many markets it charts in)
+      - freshness (how recently it was released)
+    A song released days ago already charting in several countries is a far
+    stronger 'breaking out' signal than an established hit sitting everywhere.
+    Honest, computed on real data, no scraping. Exact TikTok counts on Pro plan.
     """
+    from datetime import datetime
+
     data = get_sounds(feed="most-played")
 
-    # keep only sounds spreading across 2+ countries (real cross-market signal)
     min_countries = 2
     try:
         min_countries = max(1, int(request.args.get("min_countries", 2)))
@@ -143,12 +148,50 @@ def tiktok_trends():
         pass
     spreading = [s for s in data if s.get("countries_count", 1) >= min_countries]
 
-    # apply standard filters (genre, country, q) but NOT the rank default sort
-    result = _apply_query(spreading, default_sort="spread")
-    result["feed"] = "tiktok-trends (cross-country spread)"
-    result["note"] = ("Sounds charting in {}+ countries simultaneously — "
-                      "a propagation signal. Exact TikTok metrics on Pro plan."
-                      .format(min_countries))
+    # --- freshness score: newer releases score higher ---
+    today = datetime.utcnow().date()
+    def days_old(s):
+        rd = s.get("release_date", "")
+        try:
+            d = datetime.strptime(rd[:10], "%Y-%m-%d").date()
+            return max(0, (today - d).days)
+        except (ValueError, TypeError):
+            return 9999  # unknown date -> treat as old
+
+    def emerging_score(s):
+        spread = s.get("countries_count", 1)
+        age = days_old(s)
+        # freshness multiplier: <=7d strongest, decays to ~1 after ~90 days
+        if age <= 7:
+            fresh = 3.0
+        elif age <= 30:
+            fresh = 2.0
+        elif age <= 90:
+            fresh = 1.3
+        else:
+            fresh = 1.0
+        return spread * fresh
+
+    for s in spreading:
+        s["days_since_release"] = days_old(s)
+        s["emerging_score"] = round(emerging_score(s), 1)
+
+    # --- diversity: max 2 tracks per artist so the radar isn't monopolized ---
+    spreading.sort(key=lambda s: s["emerging_score"], reverse=True)
+    per_artist = {}
+    diversified = []
+    for s in spreading:
+        a = s.get("artist", "").lower()
+        per_artist[a] = per_artist.get(a, 0) + 1
+        if per_artist[a] <= 2:
+            diversified.append(s)
+
+    # standard filters (genre/country/q), keep emerging-score order
+    result = _apply_query(diversified, default_sort="emerging")
+    result["feed"] = "tiktok-trends (emerging: fresh + spreading)"
+    result["note"] = ("Recent sounds spreading across {}+ countries, ranked by "
+                      "freshness x reach. Max 2 tracks per artist. "
+                      "Exact TikTok metrics on Pro plan.".format(min_countries))
     return jsonify(result)
 
 
