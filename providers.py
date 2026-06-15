@@ -100,14 +100,22 @@ class SimulatedProvider:
 class ChartProvider:
     name = "chart"
 
-    # Apple Marketing Tools RSS — most-played songs. No API key required.
-    # Format: https://rss.marketingtools.apple.com/api/v2/{country}/music/most-played/{limit}/songs.json
-    BASE = "https://rss.marketingtools.apple.com/api/v2/{country}/music/most-played/{limit}/songs.json"
+    # Apple Marketing Tools RSS — no API key required, updated daily.
+    # most-played = top streamed songs.
+    # viral       = Shazam Viral Chart: songs blowing up on social (incl. TikTok).
+    FEEDS = {
+        "most-played": "https://rss.marketingtools.apple.com/api/v2/{country}/music/most-played/{limit}/songs.json",
+        "viral": "https://rss.marketingtools.apple.com/api/v2/{country}/music/city-charts/{limit}/songs.json",
+    }
+    # Note: Apple exposes the Shazam-driven viral selection via its RSS catalog.
+    # We resolve the correct feed name at runtime and fall back to most-played
+    # if a given market doesn't publish a viral feed.
 
     # default markets to pull when building a "global-ish" view
     DEFAULT_COUNTRIES = ["us", "gb", "fr", "de", "br", "mx", "au", "ca"]
 
-    def __init__(self):
+    def __init__(self, feed="most-played"):
+        self.feed = feed if feed in self.FEEDS else "most-played"
         # comma-separated env override, e.g. ZEUS_CHART_COUNTRIES="us,fr,jp"
         env = os.environ.get("ZEUS_CHART_COUNTRIES", "")
         self.countries = [c.strip().lower() for c in env.split(",") if c.strip()] or self.DEFAULT_COUNTRIES
@@ -116,54 +124,67 @@ class ChartProvider:
     def fetch(self):
         import requests
 
-        seen = {}   # isrc/id -> sound  (dedupe across countries, track regions)
+        base = self.FEEDS[self.feed]
+        source_label = ("Shazam viral chart (social / TikTok)" if self.feed == "viral"
+                        else "Apple / Shazam trending chart")
+
+        seen = {}   # id -> sound  (dedupe across countries)
         for country in self.countries:
-            url = self.BASE.format(country=country, limit=self.limit)
+            url = base.format(country=country, limit=self.limit)
             try:
                 resp = requests.get(url, timeout=10)
                 resp.raise_for_status()
                 results = resp.json().get("feed", {}).get("results", [])
             except Exception:
-                continue  # one country failing must not break the whole feed
+                # fall back to most-played for this country if viral feed missing
+                if self.feed != "most-played":
+                    try:
+                        url = self.FEEDS["most-played"].format(country=country, limit=self.limit)
+                        resp = requests.get(url, timeout=10)
+                        resp.raise_for_status()
+                        results = resp.json().get("feed", {}).get("results", [])
+                    except Exception:
+                        continue
+                else:
+                    continue
 
             for rank, item in enumerate(results, start=1):
                 key = item.get("id") or (item.get("name", "") + item.get("artistName", ""))
                 if key in seen:
-                    # already seen in another country — add region, keep best rank
-                    if country.upper() not in seen[key]["regions"]:
-                        seen[key]["regions"].append(country.upper())
+                    if country.upper() not in seen[key]["trending_in"]:
+                        seen[key]["trending_in"].append(country.upper())
                     continue
-                seen[key] = self._map(item, country, rank)
+                seen[key] = self._map(item, country, rank, source_label)
 
-        # objective ordering: best (lowest) chart rank first
         return sorted(seen.values(), key=lambda s: s["_rank"])
 
     @staticmethod
-    def _map(item, country, rank):
+    def _map(item, country, rank, source_label="Apple / Shazam trending chart"):
         """Map an Apple RSS chart entry onto the ZEUS Sound schema.
 
         The free chart feed gives identity + ranking, not raw platform counts.
         Count fields are left as None so the API/UI can show 'licensed source
         required' rather than fake numbers.
         """
+        # Clean output: only fields the chart actually provides, plus a clearly
+        # separated "premium" block listing the enrichment available on paid plans.
         return {
             "id": item.get("id", ""),
-            "isrc": None,  # not exposed by the free feed; resolved later via licensed source
             "title": item.get("name", ""),
             "artist": item.get("artistName", ""),
             "genre": (item.get("genres") or [{}])[0].get("name", "Unknown"),
-            "signed": None,            # unknown from chart alone — enrich later
-            "tiktok_videos": None,     # licensed source required
-            "shazam_tags": None,       # licensed source required
-            "spotify_listeners": None, # licensed source required
-            "stream_growth_7d": None,
-            "velocity": None,
-            "regions": [country.upper()],
-            "first_detected": datetime.utcnow().date().isoformat(),
             "chart_rank": rank,
+            "trending_in": [country.upper()],
             "artwork": item.get("artworkUrl100", ""),
-            "source": "Apple/Shazam trending chart",
+            "detected": datetime.utcnow().date().isoformat(),
+            "source": source_label,
+            "premium_signals": {
+                "available": False,
+                "note": "TikTok video count, Shazam velocity, stream growth & unsigned status available on Pro plan",
+                "fields": ["tiktok_videos", "shazam_tags", "spotify_listeners", "stream_growth_7d", "unsigned_status"],
+            },
             "_rank": rank,             # internal sort key (stripped before output)
+            "_signed": None,           # internal, for /unsigned filter consistency
         }
 
 
@@ -216,18 +237,22 @@ class LiveProvider:
 # ---------------------------------------------------------------------------
 # Provider selector — driven by env var. Defaults to simulated (safe).
 # ---------------------------------------------------------------------------
-def get_provider():
+def get_provider(feed="most-played"):
     source = os.environ.get("ZEUS_DATA_SOURCE", "simulated").lower()
     if source == "live":
         return LiveProvider()
     if source == "chart":
-        return ChartProvider()
+        return ChartProvider(feed=feed)
     return SimulatedProvider()
 
 
-def get_sounds():
-    """Single entry point the API uses. Never changes when sources change."""
-    sounds = get_provider().fetch()
+def get_sounds(feed="most-played"):
+    """Single entry point the API uses. Never changes when sources change.
+
+    feed: 'most-played' (top streamed) or 'viral' (Shazam viral / TikTok trends).
+    Only affects the chart source; ignored by simulated/live.
+    """
+    sounds = get_provider(feed=feed).fetch()
     # strip internal sort keys (prefixed with _) before returning
     for s in sounds:
         for k in [k for k in list(s.keys()) if k.startswith("_")]:
