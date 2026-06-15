@@ -82,6 +82,8 @@ class SimulatedProvider:
                 "stream_growth_7d": growth,
                 "velocity": vel,
                 "regions": regions,
+                "trending_in": regions,
+                "countries_count": (8 if regions == ["GLOBAL"] else len(regions)),
                 "first_detected": (datetime.utcnow() - timedelta(days=detected_days)).date().isoformat(),
             })
         return sounds
@@ -100,23 +102,16 @@ class SimulatedProvider:
 class ChartProvider:
     name = "chart"
 
-    # Apple Marketing Tools RSS — no API key required, updated daily.
-    # most-played = top streamed songs.
-    # viral       = Shazam Viral Chart: songs blowing up on social (incl. TikTok).
-    FEEDS = {
-        "most-played": "https://rss.marketingtools.apple.com/api/v2/{country}/music/most-played/{limit}/songs.json",
-        "viral": "https://rss.marketingtools.apple.com/api/v2/{country}/music/city-charts/{limit}/songs.json",
-    }
-    # Note: Apple exposes the Shazam-driven viral selection via its RSS catalog.
-    # We resolve the correct feed name at runtime and fall back to most-played
-    # if a given market doesn't publish a viral feed.
+    # Apple Marketing Tools RSS — most-played songs. No API key required, daily.
+    # This is the only free music feed Apple exposes here. The "viral" signal is
+    # DERIVED in the API layer (cross-country spread), not a separate feed.
+    BASE = "https://rss.marketingtools.apple.com/api/v2/{country}/music/most-played/{limit}/songs.json"
 
     # default markets to pull when building a "global-ish" view
     DEFAULT_COUNTRIES = ["us", "gb", "fr", "de", "br", "mx", "au", "ca"]
 
     def __init__(self, feed="most-played"):
-        self.feed = feed if feed in self.FEEDS else "most-played"
-        # comma-separated env override, e.g. ZEUS_CHART_COUNTRIES="us,fr,jp"
+        self.feed = feed  # kept for API compatibility; only most-played is fetched
         env = os.environ.get("ZEUS_CHART_COUNTRIES", "")
         self.countries = [c.strip().lower() for c in env.split(",") if c.strip()] or self.DEFAULT_COUNTRIES
         self.limit = int(os.environ.get("ZEUS_CHART_LIMIT", "50"))
@@ -124,50 +119,37 @@ class ChartProvider:
     def fetch(self):
         import requests
 
-        base = self.FEEDS[self.feed]
-        source_label = ("Shazam viral chart (social / TikTok)" if self.feed == "viral"
-                        else "Apple / Shazam trending chart")
-
-        seen = {}   # id -> sound  (dedupe across countries)
+        seen = {}   # id -> sound  (dedupe across countries, accumulate spread)
         for country in self.countries:
-            url = base.format(country=country, limit=self.limit)
+            url = self.BASE.format(country=country, limit=self.limit)
             try:
                 resp = requests.get(url, timeout=10)
                 resp.raise_for_status()
                 results = resp.json().get("feed", {}).get("results", [])
             except Exception:
-                # fall back to most-played for this country if viral feed missing
-                if self.feed != "most-played":
-                    try:
-                        url = self.FEEDS["most-played"].format(country=country, limit=self.limit)
-                        resp = requests.get(url, timeout=10)
-                        resp.raise_for_status()
-                        results = resp.json().get("feed", {}).get("results", [])
-                    except Exception:
-                        continue
-                else:
-                    continue
+                continue
 
             for rank, item in enumerate(results, start=1):
                 key = item.get("id") or (item.get("name", "") + item.get("artistName", ""))
                 if key in seen:
+                    # seen in another country: add country, keep best (lowest) rank
                     if country.upper() not in seen[key]["trending_in"]:
                         seen[key]["trending_in"].append(country.upper())
+                    if rank < seen[key]["_rank"]:
+                        seen[key]["_rank"] = rank
+                        seen[key]["chart_rank"] = rank
                     continue
-                seen[key] = self._map(item, country, rank, source_label)
+                seen[key] = self._map(item, country, rank)
+
+        # compute spread (how many countries) — the real virality proxy
+        for s in seen.values():
+            s["countries_count"] = len(s["trending_in"])
 
         return sorted(seen.values(), key=lambda s: s["_rank"])
 
     @staticmethod
-    def _map(item, country, rank, source_label="Apple / Shazam trending chart"):
-        """Map an Apple RSS chart entry onto the ZEUS Sound schema.
-
-        The free chart feed gives identity + ranking, not raw platform counts.
-        Count fields are left as None so the API/UI can show 'licensed source
-        required' rather than fake numbers.
-        """
-        # Clean output: only fields the chart actually provides, plus a clearly
-        # separated "premium" block listing the enrichment available on paid plans.
+    def _map(item, country, rank):
+        """Map an Apple RSS chart entry onto the ZEUS Sound schema."""
         return {
             "id": item.get("id", ""),
             "title": item.get("name", ""),
@@ -175,16 +157,18 @@ class ChartProvider:
             "genre": (item.get("genres") or [{}])[0].get("name", "Unknown"),
             "chart_rank": rank,
             "trending_in": [country.upper()],
+            "countries_count": 1,
             "artwork": item.get("artworkUrl100", ""),
+            "release_date": item.get("releaseDate", ""),
             "detected": datetime.utcnow().date().isoformat(),
-            "source": source_label,
+            "source": "Apple / Shazam trending chart",
             "premium_signals": {
                 "available": False,
                 "note": "TikTok video count, Shazam velocity, stream growth & unsigned status available on Pro plan",
                 "fields": ["tiktok_videos", "shazam_tags", "spotify_listeners", "stream_growth_7d", "unsigned_status"],
             },
-            "_rank": rank,             # internal sort key (stripped before output)
-            "_signed": None,           # internal, for /unsigned filter consistency
+            "_rank": rank,
+            "_signed": None,
         }
 
 
