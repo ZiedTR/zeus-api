@@ -119,7 +119,10 @@ class ChartProvider:
     def fetch(self):
         import requests
 
-        seen = {}   # id -> sound  (dedupe across countries, accumulate spread)
+        def norm(s):
+            return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+        seen = {}   # normalized title+artist -> sound  (dedupe across countries)
         for country in self.countries:
             url = self.BASE.format(country=country, limit=self.limit)
             try:
@@ -130,9 +133,12 @@ class ChartProvider:
                 continue
 
             for rank, item in enumerate(results, start=1):
-                key = item.get("id") or (item.get("name", "") + item.get("artistName", ""))
+                # key on title+artist so the same song across countries merges,
+                # even when Apple assigns it different ids per market
+                key = norm(item.get("name", "")) + "|" + norm(item.get("artistName", ""))
+                if not key.strip("|"):
+                    key = item.get("id", str(rank))
                 if key in seen:
-                    # seen in another country: add country, keep best (lowest) rank
                     if country.upper() not in seen[key]["trending_in"]:
                         seen[key]["trending_in"].append(country.upper())
                     if rank < seen[key]["_rank"]:
