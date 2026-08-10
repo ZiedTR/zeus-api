@@ -188,8 +188,9 @@ class ChartProvider:
             "source": "Apple / Shazam trending chart",
             "premium_signals": {
                 "available": False,
-                "note": "TikTok video count, Shazam velocity, stream growth & unsigned status available on Pro plan",
-                "fields": ["tiktok_videos", "shazam_tags", "spotify_listeners", "stream_growth_7d", "unsigned_status"],
+                "note": "Real Spotify artist signals (followers, popularity, genres) available on Pro/Ultra. "
+                        "Exact TikTok video counts & unsigned status require a licensed provider, not yet connected.",
+                "fields": ["spotify_followers", "spotify_popularity", "spotify_genres"],
             },
             "_rank": rank,
             "_signed": None,
