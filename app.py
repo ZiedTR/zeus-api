@@ -17,13 +17,14 @@ from providers import get_sounds, get_provider
 
 app = Flask(__name__)
 
-# --- RapidAPI proxy verification -------------------------------------------
-# If set, only requests carrying the matching X-RapidAPI-Proxy-Secret header
-# are served. This is what makes tier-gating below trustworthy: without it,
-# anyone could call this URL directly and forge X-RapidAPI-Subscription to
-# get premium data for free. Set this to the "Proxy Secret" shown in your
-# RapidAPI Studio's Security settings. Left unset (e.g. local dev), the
-# check is skipped entirely.
+# --- Marketplace proxy verification -----------------------------------------
+# ZEUS is listed on multiple marketplaces (RapidAPI, Zyla API Hub, ...). Base
+# data (chart endpoints) is free and open to everyone, from any marketplace or
+# direct call — it is NEVER blocked here. Only the *premium* Spotify
+# enrichment is gated, and only RapidAPI's claim of a paying plan is trusted,
+# because only RapidAPI gives us a secret to verify the claim actually came
+# through its proxy. Without that check, anyone could forge
+# X-RapidAPI-Subscription directly and get premium data for free.
 RAPIDAPI_PROXY_SECRET = os.environ.get("ZEUS_RAPIDAPI_PROXY_SECRET", "")
 
 # Which RapidAPI plan names (from X-RapidAPI-Subscription) count as "paying".
@@ -35,17 +36,14 @@ PREMIUM_PLANS = {
 }
 
 
-@app.before_request
-def _verify_rapidapi_proxy():
-    if not RAPIDAPI_PROXY_SECRET or request.path == "/health":
-        return
-    provided = request.headers.get("X-RapidAPI-Proxy-Secret", "")
-    if not hmac.compare_digest(provided, RAPIDAPI_PROXY_SECRET):
-        return jsonify({"error": "Forbidden: requests must go through RapidAPI"}), 403
-
-
 def _is_premium_request():
     sub = request.headers.get("X-RapidAPI-Subscription", "")
+    if not sub:
+        return False
+    if RAPIDAPI_PROXY_SECRET:
+        provided = request.headers.get("X-RapidAPI-Proxy-Secret", "")
+        if not hmac.compare_digest(provided, RAPIDAPI_PROXY_SECRET):
+            return False  # claims a paid plan but can't prove it came via RapidAPI
     return sub.strip().lower() in PREMIUM_PLANS
 
 
