@@ -57,6 +57,35 @@ python app.py
 2. Define the endpoints above, set your pricing tiers (Basic / Pro / Ultra).
 3. RapidAPI handles auth, billing, and rate limiting — you never touch the
    client's payment directly.
+4. In RapidAPI Studio → Security, copy the **Proxy Secret** and set it as
+   `ZEUS_RAPIDAPI_PROXY_SECRET` on Render (see below) — this is what stops
+   people from calling your Render URL directly and faking a paid plan.
+
+## Tier gating (pay-to-unlock, zero cost to you)
+
+Everyone gets the free chart data from `/sounds` and `/tiktok-trends`. Paying
+tiers additionally get real Spotify artist signals merged in — followers,
+popularity score, genres — fetched live via Spotify's official (free) API.
+Nothing is fetched, and nothing costs anything, until a paying request comes in.
+
+Setup (both required for gating to actually work):
+
+- `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — free, from
+  https://developer.spotify.com/dashboard (create an app, no cost, no
+  volume billing). Without these, premium enrichment is silently skipped.
+- `ZEUS_RAPIDAPI_PROXY_SECRET` — the Proxy Secret from RapidAPI Studio
+  (Security tab). **Without this set, anyone can call your Render URL
+  directly with a forged `X-RapidAPI-Subscription: ultra` header and get
+  the paid data for free** — RapidAPI's proxy secret is the only thing that
+  proves a request actually came through RapidAPI's billing.
+- `ZEUS_PREMIUM_PLANS` — comma-separated plan names that count as "paying"
+  (default: `pro,ultra`). Must match the plan names you create in RapidAPI
+  Studio exactly (case-insensitive).
+- `ZEUS_SPOTIFY_CACHE_TTL` — seconds to cache each artist's Spotify data
+  (default: 21600 = 6h), to stay well under Spotify's rate limits.
+
+Every response includes `"premium_enriched": true/false` so clients (and you)
+can see whether the gate fired.
 
 ## Data sources (the `ZEUS_DATA_SOURCE` switch)
 
@@ -67,7 +96,11 @@ one environment variable — the rest of the API never changes.
 |--------------------|------|------------|
 | `simulated` (default) | free | Realistic placeholder data — for demos |
 | `chart` | **free** | **Apple/Shazam official trending chart (RSS) — your $0 MVP** |
-| `live` | paid | Licensed provider (Songstats/Soundcharts) — full TikTok counts |
+| `live` | paid | Licensed provider (Songstats/Soundcharts) — full TikTok counts (optional, future upgrade) |
+
+> Note: paying tiers do **not** require `live`/a paid provider anymore — see
+> "Tier gating" below. `live` stays available for later if you want exact
+> TikTok counts and are willing to pay a licensed provider for them.
 
 ### The free `chart` mode — your $0 launch
 
@@ -84,6 +117,10 @@ come from the paid `live` source later, once the client pays.
 Optional env vars:
 - `ZEUS_CHART_COUNTRIES` — comma-separated, e.g. `us,fr,jp` (default: us,gb,fr,de,br,mx,au,ca)
 - `ZEUS_CHART_LIMIT` — entries per country: 10, 25, 50, or 100 (default: 50)
+- `ZEUS_CACHE_TTL` — seconds to cache fetched results per data source/feed
+  (default: 900 = 15 min). Country feeds are fetched in parallel and cached
+  so requests stay fast and don't hammer the upstream feed or a paid
+  provider on every call.
 
 ### Connecting real licensed data later (`live` mode)
 

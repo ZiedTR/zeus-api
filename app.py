@@ -7,10 +7,57 @@ Stack: Python / Flask. Deploy on Render. Distribute on RapidAPI.
 Data comes from providers.get_sounds() — simulated until real sources are connected.
 """
 
+import hmac
+import os
+
 from flask import Flask, jsonify, request
+
+import enrichment
 from providers import get_sounds, get_provider
 
 app = Flask(__name__)
+
+# --- RapidAPI proxy verification -------------------------------------------
+# If set, only requests carrying the matching X-RapidAPI-Proxy-Secret header
+# are served. This is what makes tier-gating below trustworthy: without it,
+# anyone could call this URL directly and forge X-RapidAPI-Subscription to
+# get premium data for free. Set this to the "Proxy Secret" shown in your
+# RapidAPI Studio's Security settings. Left unset (e.g. local dev), the
+# check is skipped entirely.
+RAPIDAPI_PROXY_SECRET = os.environ.get("ZEUS_RAPIDAPI_PROXY_SECRET", "")
+
+# Which RapidAPI plan names (from X-RapidAPI-Subscription) count as "paying".
+# Must match the plan names you configure in RapidAPI Studio.
+PREMIUM_PLANS = {
+    p.strip().lower()
+    for p in os.environ.get("ZEUS_PREMIUM_PLANS", "pro,ultra").split(",")
+    if p.strip()
+}
+
+
+@app.before_request
+def _verify_rapidapi_proxy():
+    if not RAPIDAPI_PROXY_SECRET or request.path == "/health":
+        return
+    provided = request.headers.get("X-RapidAPI-Proxy-Secret", "")
+    if not hmac.compare_digest(provided, RAPIDAPI_PROXY_SECRET):
+        return jsonify({"error": "Forbidden: requests must go through RapidAPI"}), 403
+
+
+def _is_premium_request():
+    sub = request.headers.get("X-RapidAPI-Subscription", "")
+    return sub.strip().lower() in PREMIUM_PLANS
+
+
+def _maybe_enrich(data):
+    """Layer real Spotify signals on chart data, for paying tiers only.
+
+    Free tier: chart data as-is. Paying tiers: same data plus real Spotify
+    followers/popularity/genres per artist — at zero marginal data cost.
+    """
+    if not enrichment.is_enrichment_available() or not _is_premium_request():
+        return data, False
+    return enrichment.enrich(data), True
 
 
 def _int(v):
@@ -123,7 +170,13 @@ def _apply_query(data, default_sort=None):
 @app.route("/sounds")
 def sounds():
     """Top streamed/played sounds (Apple Music chart)."""
-    return jsonify(_apply_query(get_sounds(feed="most-played")))
+    result = _apply_query(get_sounds(feed="most-played"))
+    result["data"], premium = _maybe_enrich(result["data"])
+    result["premium_enriched"] = premium
+    if not premium:
+        result["upgrade_note"] = ("Upgrade to Pro/Ultra to unlock real Spotify artist "
+                                   "signals (followers, popularity, genres) on every track.")
+    return jsonify(result)
 
 
 @app.route("/tiktok-trends")
@@ -192,6 +245,8 @@ def tiktok_trends():
     result["note"] = ("Recent sounds spreading across {}+ countries, ranked by "
                       "freshness x reach. Max 2 tracks per artist. "
                       "Exact TikTok metrics on Pro plan.".format(min_countries))
+    result["data"], premium = _maybe_enrich(result["data"])
+    result["premium_enriched"] = premium
     return jsonify(result)
 
 
@@ -199,7 +254,10 @@ def tiktok_trends():
 def sound_detail(sound_id):
     for s in get_sounds():
         if (s.get("isrc") or "").lower() == sound_id.lower() or str(s.get("id", "")).lower() == sound_id.lower():
-            return jsonify(s)
+            enriched, premium = _maybe_enrich([s])
+            result = enriched[0]
+            result["premium_enriched"] = premium
+            return jsonify(result)
     return jsonify({"error": "sound not found", "id": sound_id}), 404
 
 
