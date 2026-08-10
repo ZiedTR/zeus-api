@@ -61,6 +61,13 @@ python app.py
    `ZEUS_RAPIDAPI_PROXY_SECRET` on Render (see below) — this is what stops
    people from calling your Render URL directly and faking a paid plan.
 
+## Multi-marketplace listing
+
+ZEUS can be listed on more than one marketplace at once (RapidAPI, Zyla API
+Hub, ...) — they all just point to the same Render URL. Base/free endpoints
+are never blocked, regardless of which marketplace (or no marketplace) the
+request came from, so listing on a new one never requires a code change.
+
 ## Tier gating (pay-to-unlock, zero cost to you)
 
 Everyone gets the free chart data from `/sounds` and `/tiktok-trends`. Paying
@@ -68,16 +75,22 @@ tiers additionally get real Spotify artist signals merged in — followers,
 popularity score, genres — fetched live via Spotify's official (free) API.
 Nothing is fetched, and nothing costs anything, until a paying request comes in.
 
-Setup (both required for gating to actually work):
+This gating currently only works for **RapidAPI** plans, because RapidAPI is
+the only marketplace that gives providers a secret to verify a request
+actually came through its billing proxy. A request claiming a paid plan
+without a valid proxy secret is simply treated as free — never blocked,
+just not enriched. (If another marketplace offers an equivalent verification
+mechanism later, the same pattern can be added for it in `app.py`.)
+
+Setup (both required for RapidAPI gating to actually work):
 
 - `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` — free, from
   https://developer.spotify.com/dashboard (create an app, no cost, no
   volume billing). Without these, premium enrichment is silently skipped.
 - `ZEUS_RAPIDAPI_PROXY_SECRET` — the Proxy Secret from RapidAPI Studio
-  (Security tab). **Without this set, anyone can call your Render URL
-  directly with a forged `X-RapidAPI-Subscription: ultra` header and get
-  the paid data for free** — RapidAPI's proxy secret is the only thing that
-  proves a request actually came through RapidAPI's billing.
+  (Hub Listing → Gateway → Firewall Settings). Without this set, a request
+  claiming `X-RapidAPI-Subscription: ultra` is never trusted, so it just
+  gets the free data — safe by default either way.
 - `ZEUS_PREMIUM_PLANS` — comma-separated plan names that count as "paying"
   (default: `pro,ultra`). Must match the plan names you create in RapidAPI
   Studio exactly (case-insensitive).
