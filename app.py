@@ -95,6 +95,15 @@ def health():
     return jsonify({"status": "ok", "source": get_provider().name})
 
 
+@app.route("/debug-headers")
+def debug_headers():
+    """Temporary: echoes incoming request headers, to see what each
+    marketplace (RapidAPI, Zyla, ...) actually forwards to the backend —
+    e.g. whether Zyla sends any subscription/plan header we could gate on.
+    Remove once that's confirmed."""
+    return jsonify({k: v for k, v in request.headers.items()})
+
+
 # ---------------------------------------------------------------------------
 # Core: list sounds with objective filters and sorting.
 # No subjective scoring — raw signals only.
