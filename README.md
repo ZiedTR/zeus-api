@@ -84,6 +84,10 @@ come from the paid `live` source later, once the client pays.
 Optional env vars:
 - `ZEUS_CHART_COUNTRIES` — comma-separated, e.g. `us,fr,jp` (default: us,gb,fr,de,br,mx,au,ca)
 - `ZEUS_CHART_LIMIT` — entries per country: 10, 25, 50, or 100 (default: 50)
+- `ZEUS_CACHE_TTL` — seconds to cache fetched results per data source/feed
+  (default: 900 = 15 min). Country feeds are fetched in parallel and cached
+  so requests stay fast and don't hammer the upstream feed or a paid
+  provider on every call.
 
 ### Connecting real licensed data later (`live` mode)
 

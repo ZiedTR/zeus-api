@@ -11,8 +11,11 @@ To go live:
   3. Map the provider's fields onto the Sound schema below — done.
 """
 
+import concurrent.futures
 import os
 import random
+import threading
+import time
 from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
@@ -34,6 +37,17 @@ SOUND_FIELDS = [
     "regions",       # list of active region codes
     "first_detected",# ISO date the sound was first seen by ZEUS
 ]
+
+
+# ---------------------------------------------------------------------------
+# In-memory cache for get_sounds(). ChartProvider hits Apple's RSS feed once
+# per country on every fetch() call — without a cache, a single request can
+# take 10-80s (sequential network calls) and risks a gunicorn worker timeout.
+# The feed only updates ~daily, so a short TTL cache is safe and free.
+# ---------------------------------------------------------------------------
+_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+CACHE_TTL = int(os.environ.get("ZEUS_CACHE_TTL", "900"))  # seconds, default 15 min
 
 
 # ---------------------------------------------------------------------------
@@ -122,30 +136,34 @@ class ChartProvider:
         def norm(s):
             return "".join(ch for ch in (s or "").lower() if ch.isalnum())
 
-        seen = {}   # normalized title+artist -> sound  (dedupe across countries)
-        for country in self.countries:
+        def fetch_country(country):
             url = self.BASE.format(country=country, limit=self.limit)
             try:
-                resp = requests.get(url, timeout=10)
+                resp = requests.get(url, timeout=5)
                 resp.raise_for_status()
-                results = resp.json().get("feed", {}).get("results", [])
+                return country, resp.json().get("feed", {}).get("results", [])
             except Exception:
-                continue
+                return country, []
 
-            for rank, item in enumerate(results, start=1):
-                # key on title+artist so the same song across countries merges,
-                # even when Apple assigns it different ids per market
-                key = norm(item.get("name", "")) + "|" + norm(item.get("artistName", ""))
-                if not key.strip("|"):
-                    key = item.get("id", str(rank))
-                if key in seen:
-                    if country.upper() not in seen[key]["trending_in"]:
-                        seen[key]["trending_in"].append(country.upper())
-                    if rank < seen[key]["_rank"]:
-                        seen[key]["_rank"] = rank
-                        seen[key]["chart_rank"] = rank
-                    continue
-                seen[key] = self._map(item, country, rank)
+        # fetch all countries in parallel — sequential requests were the
+        # main cause of multi-second (sometimes 30s+) response times
+        seen = {}   # normalized title+artist -> sound  (dedupe across countries)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(self.countries))) as pool:
+            for country, results in pool.map(fetch_country, self.countries):
+                for rank, item in enumerate(results, start=1):
+                    # key on title+artist so the same song across countries merges,
+                    # even when Apple assigns it different ids per market
+                    key = norm(item.get("name", "")) + "|" + norm(item.get("artistName", ""))
+                    if not key.strip("|"):
+                        key = item.get("id", str(rank))
+                    if key in seen:
+                        if country.upper() not in seen[key]["trending_in"]:
+                            seen[key]["trending_in"].append(country.upper())
+                        if rank < seen[key]["_rank"]:
+                            seen[key]["_rank"] = rank
+                            seen[key]["chart_rank"] = rank
+                        continue
+                    seen[key] = self._map(item, country, rank)
 
         # compute spread (how many countries) — the real virality proxy
         for s in seen.values():
@@ -241,10 +259,22 @@ def get_sounds(feed="most-played"):
 
     feed: 'most-played' (top streamed) or 'viral' (Shazam viral / TikTok trends).
     Only affects the chart source; ignored by simulated/live.
+
+    Results are cached in-memory for CACHE_TTL seconds per (source, feed),
+    since the upstream chart feed only updates ~daily and a cold fetch hits
+    every configured country over the network.
     """
-    sounds = get_provider(feed=feed).fetch()
-    # strip internal sort keys (prefixed with _) before returning
-    for s in sounds:
-        for k in [k for k in list(s.keys()) if k.startswith("_")]:
-            s.pop(k, None)
-    return sounds
+    source = os.environ.get("ZEUS_DATA_SOURCE", "simulated").lower()
+    cache_key = (source, feed)
+
+    with _CACHE_LOCK:
+        cached = _CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < CACHE_TTL:
+        sounds = cached[1]
+    else:
+        sounds = get_provider(feed=feed).fetch()
+        with _CACHE_LOCK:
+            _CACHE[cache_key] = (time.time(), sounds)
+
+    # strip internal sort keys (prefixed with _) without mutating cached objects
+    return [{k: v for k, v in s.items() if not k.startswith("_")} for s in sounds]
