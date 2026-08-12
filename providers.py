@@ -274,8 +274,14 @@ def get_sounds(feed="most-played"):
         sounds = cached[1]
     else:
         sounds = get_provider(feed=feed).fetch()
-        with _CACHE_LOCK:
-            _CACHE[cache_key] = (time.time(), sounds)
+        if sounds:
+            with _CACHE_LOCK:
+                _CACHE[cache_key] = (time.time(), sounds)
+        elif cached:
+            # fetch failed/returned nothing (e.g. transient network issue) —
+            # keep serving the last known-good data instead of caching/
+            # returning an empty result.
+            sounds = cached[1]
 
     # strip internal sort keys (prefixed with _) without mutating cached objects
     return [{k: v for k, v in s.items() if not k.startswith("_")} for s in sounds]
