@@ -61,6 +61,23 @@ python app.py
    `ZEUS_RAPIDAPI_PROXY_SECRET` on Render (see below) — this is what stops
    people from calling your Render URL directly and faking a paid plan.
 
+## Performance & deploy
+
+Upstream chart data is fetched **off the request path**: a cron calls
+`/internal/refresh` (authenticated with `ZEUS_REFRESH_TOKEN`) and every request
+just reads the in-memory snapshot, so no request ever waits on Apple's feed —
+and if the feed is down, the last known-good snapshot keeps being served.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /internal/refresh` | Rebuild the snapshot — **this** is what your cron calls, not `/health` |
+| `GET /internal/cache` | Snapshot age / size, to confirm the cron is landing |
+
+Read **[DEPLOY.md](DEPLOY.md)** before deploying. It covers the cron target,
+`ZEUS_CACHE_TTL`, the gunicorn worker settings (the old single sync worker
+serialised every request), and the removal of `/debug-headers`, which echoed
+`X-RapidAPI-Proxy-Secret` to anyone who knew the direct Render URL.
+
 ## Multi-marketplace listing
 
 ZEUS can be listed on more than one marketplace at once (RapidAPI, Zyla API
@@ -130,10 +147,11 @@ come from the paid `live` source later, once the client pays.
 Optional env vars:
 - `ZEUS_CHART_COUNTRIES` — comma-separated, e.g. `us,fr,jp` (default: us,gb,fr,de,br,mx,au,ca)
 - `ZEUS_CHART_LIMIT` — entries per country: 10, 25, 50, or 100 (default: 50)
-- `ZEUS_CACHE_TTL` — seconds to cache fetched results per data source/feed
-  (default: 900 = 15 min). Country feeds are fetched in parallel and cached
-  so requests stay fast and don't hammer the upstream feed or a paid
-  provider on every call.
+- `ZEUS_CACHE_TTL` — how old the in-memory snapshot may get before a
+  background refresh kicks in (default: 1800 = 30 min). Keep it **above**
+  your cron interval. Requests never wait on the upstream feed: the fetch
+  happens off the request path (boot prewarm + your cron calling
+  `/internal/refresh`). See **DEPLOY.md**.
 
 ### Connecting real licensed data later (`live` mode)
 

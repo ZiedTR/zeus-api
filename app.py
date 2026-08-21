@@ -5,15 +5,22 @@ ZEUS surfaces and sorts the data; the A&R team makes the call.
 
 Stack: Python / Flask. Deploy on Render. Distribute on RapidAPI.
 Data comes from providers.get_sounds() — simulated until real sources are connected.
+
+Latency model: every endpoint reads an in-memory snapshot built off the request
+path (prewarm at boot + your cron calling /internal/refresh). Nothing here ever
+waits on Apple's feed. See DEPLOY.md.
 """
 
+import gzip
+import hashlib
 import hmac
 import os
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
 import enrichment
-from providers import get_sounds, get_provider
+import providers
+from providers import get_dataset, get_provider, get_sounds
 
 app = Flask(__name__)
 
@@ -35,6 +42,18 @@ PREMIUM_PLANS = {
     if p.strip()
 }
 
+# Shared secret your cron sends to /internal/refresh. If unset, the endpoint
+# is disabled rather than left open — a refresh is the one expensive operation
+# in this service and must not be triggerable by anyone who knows the URL.
+REFRESH_TOKEN = os.environ.get("ZEUS_REFRESH_TOKEN", "")
+
+# How long clients / the RapidAPI edge may reuse a free-tier response.
+CLIENT_CACHE_SECONDS = int(os.environ.get("ZEUS_CLIENT_CACHE", "120"))
+COMPRESS_MIN_BYTES = int(os.environ.get("ZEUS_COMPRESS_MIN", "700"))
+# Level 3 hits ~17x on this JSON for ~0.15 ms; level 6 buys 3 more points of
+# ratio for 3x the CPU, which is a bad trade on a small Render instance.
+GZIP_LEVEL = int(os.environ.get("ZEUS_GZIP_LEVEL", "3"))
+
 
 def _is_premium_request():
     sub = request.headers.get("X-RapidAPI-Subscription", "")
@@ -55,6 +74,7 @@ def _maybe_enrich(data):
     """
     if not enrichment.is_enrichment_available() or not _is_premium_request():
         return data, False
+    g.zeus_premium = True
     return enrichment.enrich(data), True
 
 
@@ -66,6 +86,40 @@ def _int(v):
         return int(str(v).replace("%", "").replace(",", "").replace("+", ""))
     except (ValueError, TypeError):
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Response pipeline: ETag/304 + gzip + cache headers.
+# On a 30 KB /sounds page this is the difference between shipping 30 KB and
+# shipping ~4 KB — or 0 bytes when the client already has the current version.
+# ---------------------------------------------------------------------------
+@app.after_request
+def _finalize(resp):
+    if resp.direct_passthrough or resp.status_code >= 400:
+        return resp
+
+    resp.headers["Vary"] = "Accept-Encoding, X-RapidAPI-Subscription"
+
+    if "Cache-Control" not in resp.headers:
+        if getattr(g, "zeus_premium", False):
+            # premium payloads differ per subscriber — never let an edge cache them
+            resp.headers["Cache-Control"] = "private, no-store"
+        else:
+            resp.headers["Cache-Control"] = "public, max-age=%d" % CLIENT_CACHE_SECONDS
+
+    body = resp.get_data()
+    resp.set_etag(hashlib.md5(body).hexdigest())
+    resp = resp.make_conditional(request)
+    if resp.status_code == 304:
+        return resp
+
+    if (len(body) >= COMPRESS_MIN_BYTES
+            and "gzip" in request.headers.get("Accept-Encoding", "")
+            and "Content-Encoding" not in resp.headers):
+        resp.set_data(gzip.compress(body, GZIP_LEVEL))
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Content-Length"] = str(len(resp.get_data()))
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -86,22 +140,51 @@ def root():
             "GET /health": "Health check",
         },
         "filters": ["country", "genre", "q", "sort", "order", "limit", "offset"],
-        "version": "1.0.0",
+        "version": "1.1.0",
     })
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "source": get_provider().name})
+    """Liveness only — deliberately does NOT touch the data snapshot, so an
+    uptime pinger can't be what keeps (or fails to keep) the cache warm."""
+    resp = jsonify({"status": "ok", "source": get_provider().name})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
-@app.route("/debug-headers")
-def debug_headers():
-    """Temporary: echoes incoming request headers, to see what each
-    marketplace (RapidAPI, Zyla, ...) actually forwards to the backend —
-    e.g. whether Zyla sends any subscription/plan header we could gate on.
-    Remove once that's confirmed."""
-    return jsonify({k: v for k, v in request.headers.items()})
+@app.route("/internal/refresh", methods=["GET", "POST"])
+def internal_refresh():
+    """Rebuild the data snapshot. THIS is what your cron should call.
+
+    Auth: send the shared secret as `X-Zeus-Refresh-Token: <token>` or
+    `?token=<token>`. Without ZEUS_REFRESH_TOKEN set, the endpoint is off.
+    """
+    if not REFRESH_TOKEN:
+        resp = jsonify({"error": "refresh endpoint disabled",
+                        "hint": "set ZEUS_REFRESH_TOKEN to enable it"})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, 503
+
+    provided = request.headers.get("X-Zeus-Refresh-Token") or request.args.get("token", "")
+    if not hmac.compare_digest(provided, REFRESH_TOKEN):
+        resp = jsonify({"error": "unauthorized"})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, 401
+
+    force = request.args.get("force", "true") != "false"
+    providers.refresh_now(feed="most-played", force=force)
+    resp = jsonify({"status": "refreshed", "cache": providers.cache_status()})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/internal/cache")
+def internal_cache():
+    """Read-only view of snapshot age/size — handy to confirm the cron works."""
+    resp = jsonify(providers.cache_status())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +199,19 @@ def _apply_query(data, default_sort=None):
 
     genre = request.args.get("genre")
     if genre:
-        data = [s for s in data if s.get("genre", "").lower() == genre.lower()]
+        gl = genre.lower()
+        data = [s for s in data if s.get("genre", "").lower() == gl]
 
     region = request.args.get("region") or request.args.get("country")
     if region:
+        ru = region.upper()
+
         def in_region(s):
-            zones = s.get("regions") or s.get("trending_in") or []
-            return region.upper() in [z.upper() for z in zones]
+            for z in (s.get("regions") or s.get("trending_in") or ()):
+                if z.upper() == ru:
+                    return True
+            return False
+
         data = [s for s in data if in_region(s)]
 
     q = request.args.get("q")
@@ -177,7 +266,8 @@ def _apply_query(data, default_sort=None):
 @app.route("/sounds")
 def sounds():
     """Top streamed/played sounds (Apple Music chart)."""
-    result = _apply_query(get_sounds(feed="most-played"))
+    ds = get_dataset(feed="most-played")
+    result = _apply_query(ds.sounds)
     result["data"], premium = _maybe_enrich(result["data"])
     result["premium_enriched"] = premium
     if not premium:
@@ -196,45 +286,26 @@ def tiktok_trends():
     A song released days ago already charting in several countries is a far
     stronger 'breaking out' signal than an established hit sitting everywhere.
     Honest, computed on real data, no scraping. Exact TikTok counts on Pro plan.
-    """
-    from datetime import datetime
 
-    data = get_sounds(feed="most-played")
+    days_since_release / emerging_score are precomputed once per snapshot in
+    providers.Dataset, so this endpoint does no date parsing per request.
+    """
+    ds = get_dataset(feed="most-played")
 
     min_countries = 2
     try:
         min_countries = max(1, int(request.args.get("min_countries", 2)))
     except ValueError:
         pass
-    spreading = [s for s in data if s.get("countries_count", 1) >= min_countries]
 
-    # --- freshness score: newer releases score higher ---
-    today = datetime.utcnow().date()
-    def days_old(s):
-        rd = s.get("release_date", "")
-        try:
-            d = datetime.strptime(rd[:10], "%Y-%m-%d").date()
-            return max(0, (today - d).days)
-        except (ValueError, TypeError):
-            return 9999  # unknown date -> treat as old
-
-    def emerging_score(s):
-        spread = s.get("countries_count", 1)
-        age = days_old(s)
-        # freshness multiplier: <=7d strongest, decays to ~1 after ~90 days
-        if age <= 7:
-            fresh = 3.0
-        elif age <= 30:
-            fresh = 2.0
-        elif age <= 90:
-            fresh = 1.3
-        else:
-            fresh = 1.0
-        return spread * fresh
-
-    for s in spreading:
-        s["days_since_release"] = days_old(s)
-        s["emerging_score"] = round(emerging_score(s), 1)
+    # copy only the sounds that survive the spread filter — the snapshot itself
+    # is shared and must stay untouched
+    spreading = []
+    for s, extra in zip(ds.sounds, ds.derived):
+        if s.get("countries_count", 1) >= min_countries:
+            item = dict(s)
+            item.update(extra)
+            spreading.append(item)
 
     # --- diversity: max 2 tracks per artist so the radar isn't monopolized ---
     spreading.sort(key=lambda s: s["emerging_score"], reverse=True)
@@ -242,8 +313,9 @@ def tiktok_trends():
     diversified = []
     for s in spreading:
         a = s.get("artist", "").lower()
-        per_artist[a] = per_artist.get(a, 0) + 1
-        if per_artist[a] <= 2:
+        n = per_artist.get(a, 0) + 1
+        per_artist[a] = n
+        if n <= 2:
             diversified.append(s)
 
     # standard filters (genre/country/q), keep emerging-score order
@@ -259,13 +331,14 @@ def tiktok_trends():
 
 @app.route("/sounds/<sound_id>")
 def sound_detail(sound_id):
-    for s in get_sounds():
-        if (s.get("isrc") or "").lower() == sound_id.lower() or str(s.get("id", "")).lower() == sound_id.lower():
-            enriched, premium = _maybe_enrich([s])
-            result = enriched[0]
-            result["premium_enriched"] = premium
-            return jsonify(result)
-    return jsonify({"error": "sound not found", "id": sound_id}), 404
+    ds = get_dataset()
+    match = ds.index.get(sound_id.lower())   # O(1) instead of scanning every sound
+    if match is None:
+        return jsonify({"error": "sound not found", "id": sound_id}), 404
+    enriched, premium = _maybe_enrich([match])
+    result = dict(enriched[0])               # copy: never mutate the shared snapshot
+    result["premium_enriched"] = premium
+    return jsonify(result)
 
 
 @app.route("/unsigned")
@@ -287,25 +360,13 @@ def unsigned():
 
 @app.route("/stats")
 def stats():
-    data = get_sounds()
-    countries = set()
-    genres = {}
-    for s in data:
-        for c in (s.get("trending_in") or s.get("regions") or []):
-            countries.add(c)
-        g = s.get("genre", "Unknown")
-        genres[g] = genres.get(g, 0) + 1
-    top_genres = sorted(genres.items(), key=lambda x: x[1], reverse=True)[:5]
-    return jsonify({
-        "sounds_tracked": len(data),
-        "countries_covered": sorted(countries),
-        "top_genres": [{"genre": g, "count": n} for g, n in top_genres],
-        "data_source": get_provider().name,
-        "updated": data[0].get("detected") if data else None,
-    })
+    """Aggregates are computed once per snapshot, not once per request."""
+    ds = get_dataset()
+    payload = dict(ds.stats)
+    payload["data_source"] = get_provider().name
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
