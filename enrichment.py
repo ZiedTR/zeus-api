@@ -18,7 +18,9 @@ import os
 import threading
 import time
 
-import requests
+# Reuse ZEUS's pooled HTTP session: Spotify calls then keep a warm TLS
+# connection instead of paying a fresh handshake per artist lookup.
+from providers import HTTP_TIMEOUT, SESSION
 
 _TOKEN_LOCK = threading.Lock()
 _TOKEN_CACHE = {"token": None, "expires_at": 0}
@@ -26,6 +28,7 @@ _TOKEN_CACHE = {"token": None, "expires_at": 0}
 _ARTIST_CACHE = {}
 _ARTIST_CACHE_LOCK = threading.Lock()
 ARTIST_CACHE_TTL = int(os.environ.get("ZEUS_SPOTIFY_CACHE_TTL", "21600"))  # 6h
+ENRICH_CONCURRENCY = max(1, int(os.environ.get("ZEUS_SPOTIFY_CONCURRENCY", "8")))
 
 
 def is_enrichment_available():
@@ -44,11 +47,11 @@ def _get_token():
 
         auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         try:
-            resp = requests.post(
+            resp = SESSION.post(
                 "https://accounts.spotify.com/api/token",
                 headers={"Authorization": f"Basic {auth}"},
                 data={"grant_type": "client_credentials"},
-                timeout=5,
+                timeout=HTTP_TIMEOUT,
             )
             resp.raise_for_status()
             body = resp.json()
@@ -69,11 +72,11 @@ def _lookup_artist(name, token):
 
     data = None
     try:
-        resp = requests.get(
+        resp = SESSION.get(
             "https://api.spotify.com/v1/search",
             headers={"Authorization": f"Bearer {token}"},
             params={"q": name, "type": "artist", "limit": 1},
-            timeout=5,
+            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         items = resp.json().get("artists", {}).get("items", [])
@@ -107,15 +110,30 @@ def enrich(sounds):
     if not artists:
         return sounds
 
-    results = {}
-
     def work(name):
         return name, _lookup_artist(name, token)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(artists))) as pool:
-        for name, data in pool.map(work, artists):
-            if data:
-                results[name] = data
+    # Artists already in the 6h cache resolve without any network call, so only
+    # the genuine misses go through the pool.
+    now = time.time()
+    with _ARTIST_CACHE_LOCK:
+        cached = {a: _ARTIST_CACHE.get(a.lower().strip()) for a in artists}
+    results = {}
+    misses = []
+    for a in artists:
+        hit = cached.get(a)
+        if hit and (now - hit[0]) < ARTIST_CACHE_TTL:
+            if hit[1]:
+                results[a] = hit[1]
+        else:
+            misses.append(a)
+
+    if misses:
+        workers = max(1, min(ENRICH_CONCURRENCY, len(misses)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for name, data in pool.map(work, misses):
+                if data:
+                    results[name] = data
 
     enriched = []
     for s in sounds:
